@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Frontend dependencies and build output
+/frontend/node_modules/
+/frontend/dist/
+/frontend/dist-ssr/
+
+# Local configuration and secrets
+.env*
+!.env.example
+!.env.docker.example
+
+# Logs and machine-specific files
+*.log
+.DS_Store
+.idea/
+.vscode/

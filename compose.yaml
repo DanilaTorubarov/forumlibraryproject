@@ -1,0 +1,24 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file: .env.docker
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: dhi.io/postgres:18
+    environment:
+      POSTGRES_DB: project_db
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "project_db"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  pgdata:
