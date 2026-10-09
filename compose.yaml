@@ -19,6 +19,16 @@ services:
       test: ["CMD", "pg_isready", "-U", "postgres", "-d", "project_db"]
       interval: 5s
       retries: 10
+  tests:
+    image: dhi.io/rust:1-dev
+    working_dir: /app
+    volumes:
+      - .:/app
+    env_file: .env.docker
+    depends_on:
+      db:
+        condition: service_healthy
+    command: cargo test
 
 volumes:
   pgdata:
