@@ -1,11 +1,7 @@
-use serde;
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
-use axum::{ Json, Router, http::{ self, StatusCode }, routing::post, extract::State };
-use argon2::{
-    Argon2,
-    password_hash::{ self, PasswordHasher, PasswordVerifier, phc::PasswordHash },
-};
+use axum::{ Json, Router, http::{ StatusCode }, routing::post, extract::State };
+use argon2::{ Argon2, password_hash::{ PasswordHasher, PasswordVerifier, phc::PasswordHash } };
 use sqlx::Row;
 
 #[tokio::main]
@@ -19,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fallback_service(ServeDir::new("frontend/dist"))
         .with_state(pool);
     println!("Server running: http://127.0.0.1:8080");
-    let _ = axum::serve(listener, app).await;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
@@ -48,33 +44,46 @@ async fn register_user(
     State(pool): State<sqlx::PgPool>,
     Json(input): Json<Registration>
 ) -> Result<StatusCode, StatusCode> {
+    let email = input.email.to_lowercase();
+    let login = input.login.to_lowercase();
     let missing_text = [&input.email, &input.name, &input.surname, &input.login]
         .iter()
         .any(|value| value.trim().is_empty());
     if
-        !input.login
-            .chars()
-            .all(|ch| { ch.is_ascii_alphanumeric() || matches!(ch, '_' | '!' | '@') }) ||
-        !email_address::EmailAddress::is_valid(&input.email) ||
+        !login.chars().all(|ch| { ch.is_ascii_alphanumeric() || matches!(ch, '_' | '!' | '@') }) ||
+        !email_address::EmailAddress::is_valid(&email) ||
         missing_text ||
         input.password.chars().count() < 15
     {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let existing = sqlx
+        ::query("SELECT 1 FROM users WHERE email=$1 OR login=$2")
+        .bind(&email)
+        .bind(&login)
+        .fetch_optional(&pool).await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match existing {
+        Some(_) => {
+            return Err(StatusCode::CONFLICT);
+        }
+        None => {}
+    }
     let argon2 = Argon2::default();
-    let password_bytes: &[u8] = input.password.as_bytes();
+    let password_bytes = input.password.as_bytes();
     let password_hash = argon2
         .hash_password(password_bytes)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .to_string();
     sqlx
         ::query(
-            "INSERT INTO users (name,surname,login,email,password_hash) VALUES ($1,$2,$3,$4,$5)"
+            "INSERT INTO users (name,surname,login,login_displayed,email,password_hash) VALUES ($1,$2,$3,$4,$5,$6)"
         )
         .bind(&input.name)
         .bind(&input.surname)
+        .bind(&login)
         .bind(&input.login)
-        .bind(&input.email)
+        .bind(&email)
         .bind(&password_hash)
         .execute(&pool).await
         .map_err(|error| {
@@ -90,9 +99,10 @@ async fn login_user(
     State(pool): State<sqlx::PgPool>,
     Json(input): Json<Login>
 ) -> Result<StatusCode, StatusCode> {
+    let email = input.email.to_lowercase();
     let row = sqlx
         ::query("SELECT password_hash FROM users WHERE email = $1")
-        .bind(&input.email)
+        .bind(&email)
         .fetch_optional(&pool).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let Some(row) = row else {
@@ -113,6 +123,7 @@ async fn login_user(
 #[cfg(test)]
 mod test {
     use super::*;
+    use rand::{ distr::Alphanumeric, RngExt };
 
     #[tokio::test]
     async fn database_connection_works() -> Result<(), Box<dyn std::error::Error>> {
@@ -122,28 +133,227 @@ mod test {
     }
 
     #[tokio::test]
-    async fn database_user_register_works() -> Result<(), Box<dyn std::error::Error>> {
+    async fn database_user_login_or_register_works() -> Result<(), Box<dyn std::error::Error>> {
         let pool = connect().await?;
+        let random: String = rand
+            ::rng()
+            .sample_iter(Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect();
+        let email = format!("test_{random}@example.com").to_lowercase();
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "Test".to_owned(),
+                surname: "User@".to_owned(),
+                login: format!("test_{random}").to_lowercase(),
+                email: email.clone(),
+                password: "a-long-test-password".to_owned(),
+            })
+        ).await;
+        assert_eq!(result, Ok(StatusCode::CREATED));
+        let result = login_user(
+            State(pool.clone()),
+            Json(Login {
+                email: email.clone(),
+                password: "a-long-test-password".to_owned(),
+            })
+        ).await;
+        sqlx::query("DELETE FROM users WHERE email= $1").bind(email.clone()).execute(&pool).await?;
+        assert_eq!(result, Ok(StatusCode::OK));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn register_empty_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect().await?;
+        let random: String = rand
+            ::rng()
+            .sample_iter(Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect();
+        let email = format!("test_{random}@example.com").to_lowercase();
+        let login = random.to_lowercase();
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "".to_owned(),
+                surname: "User".to_owned(),
+                login: login.clone(),
+                email: email.clone(),
+                password: "a-long-test-password".to_owned(),
+            })
+        ).await;
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "Test".to_owned(),
+                surname: "".to_owned(),
+                login: login.clone(),
+                email: email.clone(),
+                password: "a-long-test-password".to_owned(),
+            })
+        ).await;
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
         let result = register_user(
             State(pool.clone()),
             Json(Registration {
                 name: "Test".to_owned(),
                 surname: "User".to_owned(),
-                login: "test_user_123".to_owned(),
-                email: "test_123@example.com".to_owned(),
+                login: "".to_owned(),
+                email: email.clone(),
                 password: "a-long-test-password".to_owned(),
             })
         ).await;
-        assert_eq!(result, Ok(StatusCode::CREATED));
-        sqlx
-            ::query("DELETE FROM users WHERE email= $1")
-            .bind("test_123@example.com")
-            .execute(&pool).await?;
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "".to_owned(),
+                surname: "User".to_owned(),
+                login: login.clone(),
+                email: "".to_owned(),
+                password: "a-long-test-password".to_owned(),
+            })
+        ).await;
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "".to_owned(),
+                surname: "User".to_owned(),
+                login: login.clone(),
+                email: email.clone(),
+                password: "".to_owned(),
+            })
+        ).await;
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
         Ok(())
     }
 
     #[tokio::test]
-    async fn database_user_login_works() -> Result<(), Box<dyn std::error::Error>> {
+    async fn register_login_characters_fields() -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect().await?;
+        let random: String = rand
+            ::rng()
+            .sample_iter(Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect();
+        let email = format!("test_{random}@example.com").to_lowercase();
+        let login = format!("!te_{random}@").to_lowercase();
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "Test".to_owned(),
+                surname: "User".to_owned(),
+                login: "Test Test".to_owned(),
+                email: email.clone(),
+                password: "a-long-test-password".to_owned(),
+            })
+        ).await;
+        sqlx::query("DELETE FROM users WHERE email= $1").bind(email.clone()).execute(&pool).await?;
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "Test".to_owned(),
+                surname: "User".to_owned(),
+                login: "Test.Test".to_owned(),
+                email: email.clone(),
+                password: "a-long-test-password".to_owned(),
+            })
+        ).await;
+        sqlx::query("DELETE FROM users WHERE email= $1").bind(email.clone()).execute(&pool).await?;
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "Test".to_owned(),
+                surname: "User".to_owned(),
+                login: "Test,Test".to_owned(),
+                email: email.clone(),
+                password: "a-long-test-password".to_owned(),
+            })
+        ).await;
+        sqlx::query("DELETE FROM users WHERE email= $1").bind(email.clone()).execute(&pool).await?;
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "Test".to_owned(),
+                surname: "User".to_owned(),
+                login: login.to_owned(),
+                email: email.clone(),
+                password: "a-long-test-password".to_owned(),
+            })
+        ).await;
+        sqlx::query("DELETE FROM users WHERE email= $1").bind(email.clone()).execute(&pool).await?;
+        assert_eq!(result, Ok(StatusCode::CREATED));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn register_invalid_email() -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect().await?;
+        let email: String = rand
+            ::rng()
+            .sample_iter(Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect();
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "Test".to_owned(),
+                surname: "User".to_owned(),
+                login: email.clone(),
+                email: email.clone(),
+                password: "a-long-test-password".to_owned(),
+            })
+        ).await;
+        sqlx::query("DELETE FROM users WHERE email= $1").bind(email.clone()).execute(&pool).await?;
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn register_short_password() -> Result<(), Box<dyn std::error::Error>> {
+        let pool = connect().await?;
+        let random: String = rand
+            ::rng()
+            .sample_iter(Alphanumeric)
+            .take(16)
+            .map(char::from)
+            .collect();
+        let email = format!("test_{random}@example.com").to_lowercase();
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "Test".to_owned(),
+                surname: "User".to_owned(),
+                login: random.to_lowercase(),
+                email: email.clone(),
+                password: "15fifteencharac".to_owned(),
+            })
+        ).await;
+        sqlx::query("DELETE FROM users WHERE email= $1").bind(email.clone()).execute(&pool).await?;
+        assert_eq!(result, Ok(StatusCode::CREATED));
+        let result = register_user(
+            State(pool.clone()),
+            Json(Registration {
+                name: "Test".to_owned(),
+                surname: "User".to_owned(),
+                login: random.to_lowercase(),
+                email: email.clone(),
+                password: "14fourteenchar".to_owned(),
+            })
+        ).await;
+        sqlx::query("DELETE FROM users WHERE email= $1").bind(email.clone()).execute(&pool).await?;
+        assert_eq!(result, Err(StatusCode::BAD_REQUEST));
         Ok(())
     }
 }

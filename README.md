@@ -71,6 +71,12 @@ Use `\dt` to list tables and `\q` to leave `psql`.
 # Start again and rebuild after code changes
 docker compose --env-file .env.docker up --build -d
 
+# Tests
+docker compose --env-file .env.docker run --rm tests
+
+# DataBase
+docker compose --env-file .env.docker exec db psql -U postgres -d project_db
+
 # Check container status
 docker compose --env-file .env.docker ps
 

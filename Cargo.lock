@@ -918,6 +918,7 @@ dependencies = [
  "axum",
  "dotenvy",
  "email_address",
+ "rand",
  "serde",
  "sqlx",
  "tokio",
